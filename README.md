@@ -5,7 +5,6 @@
 
 - 仓库：https://github.com/jvkdhb/zcode-remote
 - 下载：https://github.com/jvkdhb/zcode-remote/releases （未签名 HAP，需侧载工具）
-- 备用下载站：https://zcode-remote-hap-uuiq.zai.site
 
 ## 功能
 
