@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "ZCode 遥控"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "扫码连接电脑端 ZCode"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "ZCode 遥控"
+    }
+  ]
+}
