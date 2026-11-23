@@ -2,12 +2,8 @@ import { scanBarcode, scanCore } from '@kit.ScanKit';
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { promptAction, router } from '@kit.ArkUI';
-import { picker, fileIo as fs } from '@kit.CoreFileKit';
 import { ParsedRemoteLink, RemoteLink } from '../service/RemoteLink';
 import { RecentSession, SessionStore } from '../service/SessionStore';
-
-const EMBEDDED_HAP_RAWFILE: string = 'ZcodeRemote-v5.hap';
-const EMBEDDED_HAP_NAME: string = 'ZcodeRemote-v5.hap';
 
 @Entry
 @Component
@@ -15,7 +11,7 @@ struct Index {
   @State linkInput: string = '';
   @State recent: RecentSession[] = [];
   @State scanning: boolean = false;
-  @State exporting: boolean = false;
+
 
   aboutToAppear(): void {
     this.refreshRecent();
@@ -81,32 +77,6 @@ struct Index {
     return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
 
-  private async exportHap(): Promise<void> {
-    if (this.exporting) {
-      return;
-    }
-    this.exporting = true;
-    try {
-      const context = getContext(this) as common.Context;
-      const docPicker = new picker.DocumentViewPicker(context);
-      const opts = new picker.DocumentSaveOptions();
-      opts.newFileNames = [EMBEDDED_HAP_NAME];
-      const uris = await docPicker.save(opts);
-      if (uris.length === 0) {
-        return;
-      }
-      const srcFile = await context.resourceManager.getRawFileDescriptor(EMBEDDED_HAP_RAWFILE);
-      const dst = fs.openSync(uris[0], fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-      await fs.copyFile(srcFile.fd, dst.fd);
-      fs.closeSync(dst);
-      promptAction.showToast({ message: '已保存 ' + EMBEDDED_HAP_NAME });
-    } catch (e) {
-      const err = e as BusinessError;
-      promptAction.showToast({ message: `保存失败（${err.code}）` });
-    } finally {
-      this.exporting = false;
-    }
-  }
 
   build() {
     Column({ space: 14 }) {
@@ -132,15 +102,6 @@ struct Index {
           this.scan();
         })
 
-      Button(this.exporting ? '正在保存…' : '保存安装包（测试用）')
-        .width('100%')
-        .height(44)
-        .backgroundColor('#1B3A60')
-        .fontColor('#A9C2DE')
-        .enabled(!this.exporting)
-        .onClick(() => {
-          this.exportHap();
-        })
 
       Column({ space: 6 }) {
         Row({ space: 8 }) {
