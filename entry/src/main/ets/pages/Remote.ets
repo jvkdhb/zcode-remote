@@ -3,7 +3,7 @@ import { router, window, promptAction } from '@kit.ArkUI';
 import { webview } from '@kit.ArkWeb';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { BusinessError, emitter } from '@kit.BasicServicesKit';
-import { picker, fileIo } from '@kit.CoreFileKit';
+import { picker, fileIo, fileUri } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { AppEvents } from '../service/AppEvents';
 
@@ -42,10 +42,10 @@ struct Remote {
   private hideTimer: number = -1;
   private fadeTimer: number = -1;
   private settleTimer: number = -1;
-  private fgAt: number = 0;
   private lastPersistAt: number = 0;
   private persistBusy: boolean = false;
   private awaitSnapshot: boolean = false;
+  private lastUploadRenamed: boolean = false;
   private readyAt: number = 0;
   private stableMs: number = 0;
   // 一次回前台只提示一次「正在恢复会话」，后续重连静默接管
@@ -244,7 +244,6 @@ struct Remote {
     if (this.remoteUrl.length === 0) {
       return;
     }
-    this.fgAt = Date.now();
     this.maskNavUntil = Date.now() + 30000;
     if (this.lastSnapshot === undefined) {
       // 快照可能在落盘/解码中，加载完成后再决定是否盖
@@ -284,7 +283,6 @@ struct Remote {
     if (!this.maskVisible && Date.now() > this.maskNavUntil) {
       return;
     }
-    hilog.info(0x0000, 'ZcodeRemote', 'page connecting, keep mask');
     if (this.hideTimer >= 0) { clearTimeout(this.hideTimer); this.hideTimer = -1; }
     if (!this.maskVisible) {
       this.showMask(false);
@@ -297,7 +295,6 @@ struct Remote {
       if (count > 0) {
         return;
       }
-      hilog.info(0x0000, 'ZcodeRemote', 'socket all closed');
       if (!this.sockClosed) {
         this.sockClosed = true;
         this.sockClosedAt = Date.now();
@@ -311,7 +308,6 @@ struct Remote {
       if (count <= 0) {
         return;
       }
-      hilog.info(0x0000, 'ZcodeRemote', 'socket open');
       this.sockClosed = false;
       this.pageConnecting = false;
       this.tryHideMask();
@@ -347,7 +343,6 @@ struct Remote {
         if (old !== undefined && !this.maskVisible) {
           old.release();
         }
-        hilog.info(0x0000, 'ZcodeRemote', 'snapshot captured status=%{public}s', String(res.status));
         this.persistSnapshot(res.imagePixelMap);
       });
     } catch (e) {
@@ -383,7 +378,6 @@ struct Remote {
         fileIo.closeSync(f);
         this.lastPersistAt = Date.now();
         this.persistBusy = false;
-        hilog.info(0x0000, 'ZcodeRemote', 'snapshot persisted bytes=%{public}d', buf.byteLength);
       }).catch((e: BusinessError) => {
         this.persistBusy = false;
         hilog.warn(0x0000, 'ZcodeRemote', 'persist snapshot failed: %{public}s', JSON.stringify(e));
@@ -641,6 +635,131 @@ struct Remote {
     }
   }
 
+  // 接管网页的 <input type=file>：图片/视频走相册，其余（文档/HAP 等）复制到 App 缓存后再交给网页，
+  // 否则 ArkWeb 拿到的文件可能没有内容（表现为「附件缺少」）。
+  private async pickFilesForWeb(event: OnShowFileSelectorEvent): Promise<void> {
+    try {
+      const accept: string[] = event.fileSelector.getAcceptType();
+      this.lastUploadRenamed = false;
+      const mode: FileSelectorMode = event.fileSelector.getMode();
+      const multiple: boolean = mode === FileSelectorMode.FileOpenMultipleMode;
+      let hasImage: boolean = false;
+      let hasVideo: boolean = false;
+      let mediaOnly: boolean = accept.length > 0;
+      for (let i = 0; i < accept.length; i++) {
+        const t: string = accept[i];
+        if (t.startsWith('image/')) {
+          hasImage = true;
+        } else if (t.startsWith('video/')) {
+          hasVideo = true;
+        } else {
+          mediaOnly = false;
+        }
+      }
+      const ctx = getContext(this) as common.UIAbilityContext;
+      let uris: string[] = [];
+      if (mediaOnly) {
+        const opt = new picker.PhotoSelectOptions();
+        if (hasImage && !hasVideo) {
+          opt.MIMEType = picker.PhotoViewMIMETypes.IMAGE_TYPE;
+        } else if (hasVideo && !hasImage) {
+          opt.MIMEType = picker.PhotoViewMIMETypes.VIDEO_TYPE;
+        } else {
+          opt.MIMEType = picker.PhotoViewMIMETypes.IMAGE_VIDEO_TYPE;
+        }
+        opt.maxSelectNumber = multiple ? 20 : 1;
+        const photoPicker = new picker.PhotoViewPicker(ctx);
+        const res: picker.PhotoSelectResult = await photoPicker.select(opt);
+        uris = res.photoUris;
+      } else {
+        const opt = new picker.DocumentSelectOptions();
+        opt.maxSelectNumber = multiple ? 10 : 1;
+        const docPicker = new picker.DocumentViewPicker(ctx);
+        uris = await docPicker.select(opt);
+      }
+      const out: string[] = [];
+      for (let i = 0; i < uris.length; i++) {
+        const u: string = uris[i];
+        if (mediaOnly) {
+          out.push(u);
+          continue;
+        }
+        const dst: string = await this.copyUploadToCache(u);
+        // handleFileList 传绝对路径（传 file:// URI 时网页能拿到元数据但读不到内容）
+        out.push(dst.length > 0 ? dst : u);
+      }
+      event.result.handleFileList(out);
+      if (this.lastUploadRenamed) {
+        promptAction.showToast({ message: '包已按 .txt 发送，接收后去掉 .txt 即可' });
+      }
+    } catch (e) {
+      hilog.warn(0x0000, 'ZcodeRemote', 'fileSelect failed: %{public}s', JSON.stringify(e));
+      try {
+        event.result.handleFileList([]);
+      } catch (e2) {
+      }
+    }
+  }
+
+  private async copyUploadToCache(uri: string): Promise<string> {
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      const base: string = ctx.cacheDir + '/zr_upload';
+      try {
+        fileIo.mkdirSync(base, true);
+      } catch (e) {
+      }
+      let name: string = '';
+      try {
+        name = new fileUri.FileUri(uri).name;
+      } catch (e) {
+      }
+      if (name.length === 0) {
+        name = uri.substring(uri.lastIndexOf('/') + 1);
+        const q: number = name.indexOf('?');
+        if (q >= 0) {
+          name = name.substring(0, q);
+        }
+      }
+      if (name.length === 0) {
+        name = 'upload.bin';
+      }
+      // .hap/.apk/.zip 等包和压缩包会被远程上传接口拒绝（「附件缺少可读取内容」），
+  // 缓存副本加 .txt 后缀绕过类型白名单；接收后去掉 .txt 即可还原
+  let finalName: string = name;
+  const blockedExts: string[] = ['.hap', '.hsp', '.app', '.apk', '.aab', '.ipa', '.zip', '.rar',
+    '.7z', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.exe', '.msi', '.dmg', '.iso', '.bin',
+    '.wav', '.flac', '.ape', '.wma', '.aac', '.ogg', '.opus'];
+  const lowerName: string = name.toLowerCase();
+  for (let i = 0; i < blockedExts.length; i++) {
+    if (lowerName.endsWith(blockedExts[i])) {
+      finalName = name + '.txt';
+      this.lastUploadRenamed = true;
+      break;
+    }
+  }
+      // 每次上传单独一个目录，文件名保持原样（网页可能按文件名判断类型）
+      const dir: string = base + '/' + Date.now();
+      try {
+        fileIo.mkdirSync(dir, true);
+      } catch (e) {
+      }
+      const dst: string = dir + '/' + finalName;
+      // 选择器返回的是 docs URI，copyFile 直接传 URI 会 13900002；先 open 再用 fd 复制
+      const src = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
+      try {
+        await fileIo.copyFile(src.fd, dst);
+      } finally {
+        fileIo.closeSync(src);
+      }
+      hilog.info(0x0000, 'ZcodeRemote', 'fileSelect copied=%{public}s', dst);
+      return dst;
+    } catch (e) {
+      hilog.warn(0x0000, 'ZcodeRemote', 'fileSelect copy failed: %{public}s', JSON.stringify(e));
+      return '';
+    }
+  }
+
   aboutToDisappear(): void {
     this.setKeepScreenOn(false);
     try {
@@ -867,7 +986,7 @@ struct Remote {
           Web({ src: this.remoteUrl, controller: this.controller })
             .javaScriptAccess(true)
             .domStorageAccess(true)
-            .fileAccess(false)
+            .fileAccess(true)
             .zoomAccess(false)
             .javaScriptOnDocumentStart([{ script: this.themeBootJs, scriptRules: ['*'] }])
             .onControllerAttached(() => {
@@ -882,8 +1001,6 @@ struct Remote {
               this.maskSuppressed = false;
               this.sockClosed = false;
               this.pageConnecting = false;
-              hilog.info(0x0000, 'ZcodeRemote', 'page begin snapshot=%{public}s sinceFg=%{public}d',
-                String(this.lastSnapshot !== undefined), this.fgAt > 0 ? Date.now() - this.fgAt : -1);
               // 回前台/手动刷新后的重载才遮；普通站内跳转直接显示新页面
               if (this.lastSnapshot !== undefined && Date.now() < this.maskNavUntil) {
                 this.showMask(false);
@@ -896,7 +1013,6 @@ struct Remote {
               this.loading = false;
               this.pageLoading = false;
               this.applyPageTheme();
-              hilog.info(0x0000, 'ZcodeRemote', 'page end mask=%{public}s', String(this.maskVisible));
               if (this.maskVisible) {
                 this.probeReady(350);
               } else {
@@ -917,6 +1033,10 @@ struct Remote {
             .onAreaChange((oldValue: Area, newValue: Area) => {
               this.webW = parseFloat(String(newValue.width)) || 0;
               this.webH = parseFloat(String(newValue.height)) || 0;
+            })
+            .onShowFileSelector((event) => {
+              this.pickFilesForWeb(event);
+              return true;
             })
             .onRenderExited((event) => {
               hilog.warn(0x0000, 'ZcodeRemote', 'render exited reason=%{public}d', event.renderExitReason);
