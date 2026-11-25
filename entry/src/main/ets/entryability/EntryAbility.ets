@@ -14,9 +14,10 @@
  */
 
 import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
-import { BusinessError } from '@kit.BasicServicesKit';
+import { BusinessError, emitter } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
+import { AppEvents } from '../service/AppEvents';
 
 const DOMAIN = 0x0000;
 
@@ -69,10 +70,20 @@ export default class EntryAbility extends UIAbility {
   onForeground(): void {
     // Ability has brought to foreground
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
+    try {
+      emitter.emit({ eventId: AppEvents.FOREGROUND });
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'emit foreground failed: %{public}s', JSON.stringify(err));
+    }
   }
 
   onBackground(): void {
     // Ability has back to background
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
+    try {
+      emitter.emit({ eventId: AppEvents.BACKGROUND });
+    } catch (err) {
+      hilog.warn(DOMAIN, 'testTag', 'emit background failed: %{public}s', JSON.stringify(err));
+    }
   }
 }

@@ -2,8 +2,10 @@ import { common, Want } from '@kit.AbilityKit';
 import { router, window, promptAction } from '@kit.ArkUI';
 import { webview } from '@kit.ArkWeb';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { BusinessError } from '@kit.BasicServicesKit';
-import { picker } from '@kit.CoreFileKit';
+import { BusinessError, emitter } from '@kit.BasicServicesKit';
+import { picker, fileIo } from '@kit.CoreFileKit';
+import { image } from '@kit.ImageKit';
+import { AppEvents } from '../service/AppEvents';
 
 interface RemoteParams {
   remoteUrl?: string;
@@ -22,10 +24,77 @@ struct Remote {
   private controller: webview.WebviewController = new webview.WebviewController();
   private authController: webview.WebviewController = new webview.WebviewController();
   private downloadDelegate: webview.WebDownloadDelegate = new webview.WebDownloadDelegate();
+  // 恢复遮罩：退后台前抓一帧 Web 快照；回前台或页面重载时先盖住旧画面，
+  // 等会话 UI 真正就绪（注入脚本回报 ZR_READY）再揭开，避免闪回加载页。
+  private lastSnapshot: image.PixelMap | undefined = undefined;
+  @State maskVisible: boolean = false;
+  @State maskHint: boolean = false;
+  private webW: number = 0;
+  private webH: number = 0;
+  private pageLoading: boolean = false;
+  private readySeen: boolean = false;
+  private minDone: boolean = false;
+  private minTimer: number = -1;
+  private probeTimer: number = -1;
+  private capTimer: number = -1;
+  private hintTimer: number = -1;
+  private hideTimer: number = -1;
+  private settleTimer: number = -1;
+  private snapTimer: number = -1;
+  private fgAt: number = 0;
+  private lastPersistAt: number = 0;
+  private persistBusy: boolean = false;
+  private awaitSnapshot: boolean = false;
+  private readyAt: number = 0;
+  private stableMs: number = 0;
+  // 只有「回前台/手动刷新」后的导航才值得用旧画面遮挡；普通站内跳转直接放行
+  private maskNavUntil: number = 0;
+  // 网页侧连接状态（由注入脚本回报）：socket 未恢复或页面处于连接中时，遮罩不揭开
+  private sockClosed: boolean = false;
+  private sockClosedAt: number = 0;
+  private pageConnecting: boolean = false;
+  private maskSuppressed: boolean = false;
+  private onFgEvent: (data: emitter.EventData) => void = (data: emitter.EventData) => {
+    this.handleAppForeground();
+  };
+  private onBgEvent: (data: emitter.EventData) => void = (data: emitter.EventData) => {
+    this.handleAppBackground();
+  };
   // 页面主题机制：localStorage `zcode-theme`（zai-dark/zai-light/system），html 上挂 dark/theme-zai-* class。
   // 本壳不支持浅色：启动前强制 zai-dark，并用 MutationObserver 兜底——任何切到浅色的动作都被立即扳回深色。
   // SPA 路由切换会重建 DOM，所以顶栏隐藏/输入栏下移也做成页内常驻自愈（observer + 300ms 防抖）。
   private readonly themeBootJs: string = `(function(){
+    // 记录网页 WebSocket 生命周期：断开/重连时回传，原生据此决定遮罩何时揭开
+    try {
+      var OWS = window.WebSocket;
+      if (OWS && !OWS.__zrPatched) {
+        var zrOpen = 0;
+        function ZrWS(url, protocols) {
+          var ws = protocols === undefined ? new OWS(url) : new OWS(url, protocols);
+          try {
+            window.__zrHasWS = true;
+            ws.addEventListener('open', function () {
+              zrOpen++;
+              window.__zrOpen = zrOpen;
+              console.info('ZR_SOCKET_OPEN ' + zrOpen);
+            });
+            ws.addEventListener('close', function () {
+              zrOpen--;
+              window.__zrOpen = zrOpen;
+              console.info('ZR_SOCKET_CLOSE ' + zrOpen);
+            });
+          } catch (e1) {}
+          return ws;
+        }
+        ZrWS.prototype = OWS.prototype;
+        ZrWS.CONNECTING = OWS.CONNECTING;
+        ZrWS.OPEN = OWS.OPEN;
+        ZrWS.CLOSING = OWS.CLOSING;
+        ZrWS.CLOSED = OWS.CLOSED;
+        ZrWS.__zrPatched = true;
+        window.WebSocket = ZrWS;
+      }
+    } catch (e0) {}
     try { localStorage.setItem('zcode-theme', 'zai-dark'); } catch (e) {}
     try {
       var st = document.createElement('style');
@@ -43,6 +112,21 @@ struct Remote {
       }
       function fix() {
         try {
+          var found = !!document.getElementById('zr-hide-topbar');
+          var conn = false;
+          try {
+            var bt = document.body ? (document.body.innerText || '') : '';
+            conn = bt.indexOf('正在连接') >= 0 || bt.indexOf('正在加载工作区') >= 0;
+          } catch (e5) {}
+          if (conn) {
+            try {
+              var cnow = Date.now();
+              if (!window.__zrConnAt || cnow - window.__zrConnAt > 800) {
+                window.__zrConnAt = cnow;
+                console.info('ZR_CONNECTING');
+              }
+            } catch (e6) {}
+          }
           if (document.body && !document.getElementById('zr-hide-topbar')) {
             var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null), n;
             while ((n = w.nextNode())) {
@@ -54,6 +138,7 @@ struct Remote {
                   if (r.top < 220 && r.height > 0 && r.height < 110 && r.width > 300) {
                     e.id = 'zr-hide-topbar';
                     e.style.setProperty('display', 'none', 'important');
+                    found = true;
                     break;
                   }
                   e = e.parentElement;
@@ -73,6 +158,7 @@ struct Remote {
               card = card.parentElement;
             }
             if (card && card !== document.body) {
+              found = true;
               // v5：卡片本身保形；把卡片之上的所有祖先（含 body/html）的下内边距/外边距清零
               var a = card.parentElement;
               for (var k = 0; k < 12 && a; k++) {
@@ -91,10 +177,20 @@ struct Remote {
               }
             }
           }
+          if (found && !conn) {
+            try {
+              var now = Date.now();
+              if (!window.__zrReadyAt || now - window.__zrReadyAt > 800) {
+                window.__zrReadyAt = now;
+                console.info('ZR_READY ' + (window.__zrHasWS ? 1 : 0) + ' ' + (window.__zrOpen || 0));
+              }
+            } catch (e2) {}
+          }
         } catch (e) {}
       }
       var timer = null;
       new MutationObserver(function () {
+        window.__zrLastMut = Date.now();
         enforceTheme();
         if (timer) { return; }
         timer = setTimeout(function () { timer = null; fix(); }, 300);
@@ -113,6 +209,376 @@ struct Remote {
     }
     this.setKeepScreenOn(true);
     this.setupDownload();
+    try {
+      // 快照依赖整页绘制能力；必须在 Web 组件初始化前调用
+      webview.WebviewController.enableWholeWebPageDrawing();
+    } catch (e) {
+      hilog.warn(0x0000, 'ZcodeRemote', 'enableWholeWebPageDrawing failed: %{public}s', JSON.stringify(e));
+    }
+    emitter.on({ eventId: AppEvents.FOREGROUND }, this.onFgEvent);
+    emitter.on({ eventId: AppEvents.BACKGROUND }, this.onBgEvent);
+    this.loadPersistedSnapshot();
+  }
+
+  // ---- 恢复遮罩：后台抓帧，回前台/重载时盖住，会话就绪后揭开 ----
+
+  private handleAppBackground(): void {
+    this.clearMask();
+    this.stopSnapTimer();
+    this.captureSnapshot(true);
+  }
+
+  private startSnapTimer(): void {
+    if (this.snapTimer >= 0) {
+      return;
+    }
+    this.snapTimer = setInterval(() => {
+      if (!this.maskVisible) {
+        this.captureSnapshot();
+      }
+    }, 15000);
+  }
+
+  private stopSnapTimer(): void {
+    if (this.snapTimer >= 0) {
+      clearInterval(this.snapTimer);
+      this.snapTimer = -1;
+    }
+  }
+
+  private handleAppForeground(): void {
+    if (this.remoteUrl.length === 0) {
+      return;
+    }
+    this.fgAt = Date.now();
+    this.maskNavUntil = Date.now() + 30000;
+    if (this.lastSnapshot === undefined) {
+      // 快照可能在落盘/解码中，加载完成后再决定是否盖
+      this.awaitSnapshot = true;
+      hilog.info(0x0000, 'ZcodeRemote', 'resume: no snapshot in memory yet');
+      return;
+    }
+    this.awaitSnapshot = false;
+    hilog.info(0x0000, 'ZcodeRemote', 'resume: mask on, snapshot=%{public}s', String(this.lastSnapshot !== undefined));
+    this.sockClosed = false;
+    this.sockClosedAt = 0;
+    this.pageConnecting = false;
+    this.maskSuppressed = false;
+    this.showMask(true);
+    this.probeReady(350);
+    // 页面若没重载（没有 onPageBegin）且连接正常，3.5s 内揭开
+    this.settleTimer = setTimeout(() => {
+      this.settleTimer = -1;
+      if (!this.pageLoading && !this.sockClosed) {
+        this.clearMask();
+      }
+    }, 3500);
+  }
+
+  private onPageConnecting(): void {
+    this.pageConnecting = true;
+    if (this.lastSnapshot === undefined || this.maskSuppressed) {
+      return;
+    }
+    if (!this.sockClosed) {
+      this.sockClosed = true;
+      this.sockClosedAt = Date.now();
+    }
+    this.readySeen = false;
+    // 只在回前台/手动刷新后的窗口内遮；平时断网不擅自盖住页面
+    if (!this.maskVisible && Date.now() > this.maskNavUntil) {
+      return;
+    }
+    hilog.info(0x0000, 'ZcodeRemote', 'page connecting, keep mask');
+    if (this.hideTimer >= 0) { clearTimeout(this.hideTimer); this.hideTimer = -1; }
+    if (!this.maskVisible) {
+      this.showMask(false);
+    }
+  }
+
+  private onSocketChanged(msg: string): void {
+    const count: number = this.parseSocketCount(msg);
+    if (msg.indexOf('ZR_SOCKET_CLOSE') >= 0) {
+      if (count > 0) {
+        return;
+      }
+      hilog.info(0x0000, 'ZcodeRemote', 'socket all closed');
+      if (!this.sockClosed) {
+        this.sockClosed = true;
+        this.sockClosedAt = Date.now();
+      }
+      if (this.hideTimer >= 0) { clearTimeout(this.hideTimer); this.hideTimer = -1; }
+      if (this.lastSnapshot !== undefined && !this.maskVisible && !this.maskSuppressed &&
+        Date.now() <= this.maskNavUntil) {
+        this.showMask(false);
+      }
+    } else {
+      if (count <= 0) {
+        return;
+      }
+      hilog.info(0x0000, 'ZcodeRemote', 'socket open');
+      this.sockClosed = false;
+      this.pageConnecting = false;
+      this.tryHideMask();
+    }
+  }
+
+  private parseSocketCount(msg: string): number {
+    const i: number = msg.lastIndexOf(' ');
+    if (i < 0) {
+      return -1;
+    }
+    const n: number = Number(msg.substring(i + 1));
+    return isNaN(n) ? -1 : n;
+  }
+
+  private captureSnapshot(force: boolean = false): void {
+    // 页面被遮/正在连接时不抓；force 用于退后台前最后一张（哪怕画面是连接页，也是用户最后看到的）
+    if (this.maskVisible || (!force && this.pageConnecting)) {
+      return;
+    }
+    try {
+      const info: webview.SnapshotInfo = {};
+      if (this.webW > 0 && this.webH > 0) {
+        info.size = { width: this.webW, height: this.webH };
+      }
+      this.controller.webPageSnapshot(info, (err: BusinessError, res: webview.SnapshotResult) => {
+        if (err || res === undefined || res.imagePixelMap === undefined) {
+          hilog.warn(0x0000, 'ZcodeRemote', 'snapshot failed: %{public}s', JSON.stringify(err));
+          return;
+        }
+        const old: image.PixelMap | undefined = this.lastSnapshot;
+        this.lastSnapshot = res.imagePixelMap;
+        if (old !== undefined && !this.maskVisible) {
+          old.release();
+        }
+        hilog.info(0x0000, 'ZcodeRemote', 'snapshot captured status=%{public}s', String(res.status));
+        this.persistSnapshot(res.imagePixelMap);
+      });
+    } catch (e) {
+      hilog.warn(0x0000, 'ZcodeRemote', 'webPageSnapshot failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private framePath(): string {
+    const ctx = getContext(this) as common.UIAbilityContext;
+    return ctx.filesDir + '/zr_frame_' + this.urlHash() + '.jpg';
+  }
+
+  private urlHash(): string {
+    let h: number = 0;
+    for (let i = 0; i < this.remoteUrl.length; i++) {
+      h = (h * 31 + this.remoteUrl.charCodeAt(i)) | 0;
+    }
+    return Math.abs(h).toString(16);
+  }
+
+  // 快照落盘：页面被系统重建后，内存快照会丢，靠这个兜住
+  private persistSnapshot(pm: image.PixelMap): void {
+    if (this.persistBusy || Date.now() - this.lastPersistAt < 10000) {
+      return;
+    }
+    this.persistBusy = true;
+    try {
+      const packer: image.ImagePacker = image.createImagePacker();
+      packer.packing(pm, { format: 'image/jpeg', quality: 70 }).then((buf: ArrayBuffer) => {
+        const f = fileIo.openSync(this.framePath(),
+          fileIo.OpenMode.CREATE | fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.TRUNC);
+        fileIo.writeSync(f.fd, buf);
+        fileIo.closeSync(f);
+        this.lastPersistAt = Date.now();
+        this.persistBusy = false;
+        hilog.info(0x0000, 'ZcodeRemote', 'snapshot persisted bytes=%{public}d', buf.byteLength);
+      }).catch((e: BusinessError) => {
+        this.persistBusy = false;
+        hilog.warn(0x0000, 'ZcodeRemote', 'persist snapshot failed: %{public}s', JSON.stringify(e));
+      });
+    } catch (e) {
+      this.persistBusy = false;
+      hilog.warn(0x0000, 'ZcodeRemote', 'persist snapshot call failed: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private loadPersistedSnapshot(): void {
+    if (this.remoteUrl.length === 0) {
+      return;
+    }
+    try {
+      const path: string = this.framePath();
+      const stat = fileIo.statSync(path);
+      if (stat.size <= 0) {
+        return;
+      }
+      const f = fileIo.openSync(path, fileIo.OpenMode.READ_ONLY);
+      const buf = new ArrayBuffer(stat.size);
+      fileIo.readSync(f.fd, buf);
+      fileIo.closeSync(f);
+      const src: image.ImageSource = image.createImageSource(buf);
+      src.createPixelMap().then((pm: image.PixelMap) => {
+        if (this.lastSnapshot === undefined) {
+          this.lastSnapshot = pm;
+        } else {
+          pm.release();
+        }
+        const ageSec: number = Math.floor(Date.now() / 1000) - stat.mtime;
+        hilog.info(0x0000, 'ZcodeRemote', 'persisted snapshot loaded age=%{public}d', ageSec);
+        // 10 分钟内的旧画面才值得盖：兼容「页面被重建、回前台事件已错过」的情况
+        if (ageSec < 600 && (this.awaitSnapshot || this.loading)) {
+          this.awaitSnapshot = false;
+          this.showMask(false);
+          this.pageLoading = true;
+          this.probeReady(400);
+        }
+      }).catch((e: BusinessError) => {
+        hilog.warn(0x0000, 'ZcodeRemote', 'decode persisted snapshot failed: %{public}s', JSON.stringify(e));
+      });
+    } catch (e) {
+      hilog.info(0x0000, 'ZcodeRemote', 'no persisted snapshot: %{public}s', JSON.stringify(e));
+    }
+  }
+
+  private showMask(holdMin: boolean): void {
+    this.clearMaskTimers();
+    this.maskVisible = true;
+    this.maskHint = false;
+    this.readySeen = false;
+    this.minDone = false;
+    this.pageLoading = false;
+    this.readyAt = 0;
+    this.stableMs = 0;
+    this.minTimer = setTimeout(() => {
+      this.minTimer = -1;
+      this.minDone = true;
+      this.tryHideMask();
+    }, holdMin ? 2500 : 0);
+    this.hintTimer = setTimeout(() => {
+      this.hintTimer = -1;
+      if (this.maskVisible) {
+        this.maskHint = true;
+      }
+    }, 2500);
+    this.capTimer = setTimeout(() => {
+      this.capTimer = -1;
+      hilog.info(0x0000, 'ZcodeRemote', 'mask cap reached, reveal page');
+      this.maskSuppressed = true;
+      this.clearMask();
+    }, 15000);
+    // 遮罩一旦出现就持续探测「会话是否就绪 + DOM 是否安静」
+    this.probeReady(300);
+  }
+
+  private tryHideMask(): void {
+    if (!this.maskVisible || !this.minDone || !this.readySeen || this.pageLoading) {
+      return;
+    }
+    // 会话内容还在重排（DOM 持续变化）就继续盖；安静 0.7s 后揭，最多再多等 4s
+    if (this.stableMs < 700 && this.readyAt > 0 && Date.now() - this.readyAt < 4000) {
+      return;
+    }
+    // socket 关闭时最多再等等连接恢复；超过 6s 仍未恢复就放行，避免无限卡住
+    if (this.sockClosed) {
+      if (this.sockClosedAt > 0 && Date.now() - this.sockClosedAt < 6000) {
+        return;
+      }
+      this.sockClosed = false;
+    }
+    if (this.hideTimer >= 0) {
+      return;
+    }
+    this.hideTimer = setTimeout(() => {
+      this.hideTimer = -1;
+      // 就绪后再给内容 1.2s 落稳，避免揭开时正好是空白重拉
+      this.clearMask();
+    }, 1200);
+  }
+
+  private clearMask(): void {
+    this.clearMaskTimers();
+    this.maskVisible = false;
+    this.maskHint = false;
+    this.readySeen = false;
+    this.minDone = false;
+    this.readyAt = 0;
+    this.stableMs = 0;
+  }
+
+  private clearMaskTimers(): void {
+    if (this.minTimer >= 0) { clearTimeout(this.minTimer); this.minTimer = -1; }
+    if (this.probeTimer >= 0) { clearTimeout(this.probeTimer); this.probeTimer = -1; }
+    if (this.capTimer >= 0) { clearTimeout(this.capTimer); this.capTimer = -1; }
+    if (this.hintTimer >= 0) { clearTimeout(this.hintTimer); this.hintTimer = -1; }
+    if (this.hideTimer >= 0) { clearTimeout(this.hideTimer); this.hideTimer = -1; }
+    if (this.settleTimer >= 0) { clearTimeout(this.settleTimer); this.settleTimer = -1; }
+  }
+
+  private probeReady(delay: number): void {
+    if (this.probeTimer >= 0) {
+      clearTimeout(this.probeTimer);
+      this.probeTimer = -1;
+    }
+    this.probeTimer = setTimeout(() => {
+      this.probeTimer = -1;
+      if (!this.maskVisible) {
+        return;
+      }
+      const js: string = '(function(){try{' +
+        'var ce=document.querySelector(\'[contenteditable]\');' +
+        'var tb=document.getElementById(\'zr-hide-topbar\');' +
+        'if(!ce&&!tb)return \'0\';' +
+        'return \'1 \'+(window.__zrHasWS?1:0)+\' \'+(window.__zrOpen||0)+\' \'+(Date.now()-(window.__zrLastMut||0));' +
+        '}catch(e){return \'0\';}})()';
+      try {
+        this.controller.runJavaScript(js, (err: BusinessError, res: string) => {
+          if (!err && res !== undefined && res.charAt(0) === '1') {
+            this.applyReadyState(res);
+            const parts: string[] = res.split(' ');
+            this.stableMs = parts.length > 3 ? Number(parts[3]) : 0;
+            this.readySeen = true;
+            if (this.readyAt === 0) {
+              this.readyAt = Date.now();
+            }
+            if (this.stableMs < 700) {
+              this.probeReady(400);
+            } else {
+              this.tryHideMask();
+            }
+          } else {
+            this.probeReady(800);
+          }
+        });
+      } catch (e) {
+        hilog.warn(0x0000, 'ZcodeRemote', 'probeReady failed: %{public}s', JSON.stringify(e));
+      }
+    }, delay);
+  }
+
+  private onPageReadyLog(msg: string): void {
+    this.pageConnecting = false;
+    this.applyReadyState(msg);
+    if (!this.maskVisible) {
+      return;
+    }
+    this.readySeen = true;
+    if (this.readyAt === 0) {
+      this.readyAt = Date.now();
+    }
+    // DOM 是否安静由探针判断，这里只保证探针在跑
+    this.probeReady(400);
+  }
+
+  // 解析 "ZR_READY <hasWS> <openCount>" 或 "1 <hasWS> <openCount>"
+  private applyReadyState(res: string): void {
+    const parts: string[] = res.split(' ');
+    const hasWs: number = parts.length > 1 ? Number(parts[1]) : 0;
+    const open: number = parts.length > 2 ? Number(parts[2]) : 0;
+    const closed: boolean = hasWs === 1 && open <= 0;
+    if (closed && !this.sockClosed) {
+      this.sockClosed = true;
+      this.sockClosedAt = Date.now();
+    } else if (!closed) {
+      this.sockClosed = false;
+    }
+    this.pageConnecting = false;
   }
 
   private setupDownload(): void {
@@ -166,6 +632,18 @@ struct Remote {
 
   aboutToDisappear(): void {
     this.setKeepScreenOn(false);
+    try {
+      emitter.off(AppEvents.FOREGROUND, this.onFgEvent);
+      emitter.off(AppEvents.BACKGROUND, this.onBgEvent);
+    } catch (e) {
+      hilog.warn(0x0000, 'ZcodeRemote', 'emitter off failed: %{public}s', JSON.stringify(e));
+    }
+    this.clearMaskTimers();
+    this.stopSnapTimer();
+    if (this.lastSnapshot !== undefined) {
+      this.lastSnapshot.release();
+      this.lastSnapshot = undefined;
+    }
   }
 
   onBackPress(): boolean {
@@ -194,8 +672,10 @@ struct Remote {
   }
 
   private reload(): void {
+    hilog.info(0x0000, 'ZcodeRemote', 'manual reload');
     this.errorText = '';
     this.loading = true;
+    this.maskNavUntil = Date.now() + 30000;
     if (this.remoteUrl.length === 0) {
       this.loading = false;
       this.errorText = '缺少远程链接，请返回重新扫码。';
@@ -389,10 +869,54 @@ struct Remote {
             })
             .onPageBegin(() => {
               this.loading = true;
+              this.maskSuppressed = false;
+              this.sockClosed = false;
+              this.pageConnecting = false;
+              hilog.info(0x0000, 'ZcodeRemote', 'page begin snapshot=%{public}s sinceFg=%{public}d',
+                String(this.lastSnapshot !== undefined), this.fgAt > 0 ? Date.now() - this.fgAt : -1);
+              // 回前台/手动刷新后的重载才遮；普通站内跳转直接显示新页面
+              if (this.lastSnapshot !== undefined && Date.now() < this.maskNavUntil) {
+                this.showMask(false);
+                this.pageLoading = true;
+              } else if (this.maskVisible) {
+                this.clearMask();
+              }
             })
             .onPageEnd(() => {
               this.loading = false;
+              this.pageLoading = false;
               this.applyPageTheme();
+              this.startSnapTimer();
+              hilog.info(0x0000, 'ZcodeRemote', 'page end mask=%{public}s', String(this.maskVisible));
+              if (this.maskVisible) {
+                this.probeReady(350);
+              } else {
+                this.captureSnapshot();
+              }
+            })
+            .onConsole((event) => {
+              const msg: string = event.message.getMessage();
+              if (msg.indexOf('ZR_CONNECTING') >= 0) {
+                this.onPageConnecting();
+              } else if (msg.indexOf('ZR_SOCKET_') >= 0) {
+                this.onSocketChanged(msg);
+              } else if (msg.indexOf('ZR_READY') >= 0) {
+                this.onPageReadyLog(msg);
+              }
+              return false;
+            })
+            .onAreaChange((oldValue: Area, newValue: Area) => {
+              this.webW = parseFloat(String(newValue.width)) || 0;
+              this.webH = parseFloat(String(newValue.height)) || 0;
+            })
+            .onRenderExited((event) => {
+              hilog.warn(0x0000, 'ZcodeRemote', 'render exited reason=%{public}d', event.renderExitReason);
+              if (this.lastSnapshot !== undefined) {
+                this.maskNavUntil = Date.now() + 30000;
+                this.maskSuppressed = false;
+                this.showMask(false);
+                this.pageLoading = true;
+              }
             })
             .onProgressChange((event) => {
               this.progress = event.newProgress;
@@ -402,6 +926,7 @@ struct Remote {
                 return;
               }
               this.loading = false;
+              this.clearMask();
               this.errorText = `网络错误：${event.error.getErrorInfo()}`;
             })
             .onHttpErrorReceive((event) => {
@@ -411,11 +936,13 @@ struct Remote {
                 return;
               }
               this.loading = false;
+              this.clearMask();
               this.errorText = `HTTP 错误：${event.response.getResponseCode()}`;
             })
             .onSslErrorEventReceive((event) => {
               event.handler.handleCancel();
               this.loading = false;
+              this.clearMask();
               this.errorText = '证书校验失败，已阻止连接。';
             })
             .onPermissionRequest((event) => {
@@ -438,6 +965,27 @@ struct Remote {
             })
             .width('100%')
             .height('100%')
+        }
+
+        if (this.maskVisible && this.lastSnapshot !== undefined) {
+          Stack({ alignContent: Alignment.Bottom }) {
+            Image(this.lastSnapshot as image.PixelMap)
+              .width('100%')
+              .height('100%')
+              .objectFit(ImageFit.Fill)
+              .interpolation(ImageInterpolation.High)
+            if (this.maskHint) {
+              Text('正在恢复会话…')
+                .fontSize(11)
+                .fontColor('#B9CDE6')
+                .backgroundColor('#CC102A4A')
+                .padding({ left: 12, right: 12, top: 5, bottom: 5 })
+                .borderRadius(12)
+                .margin({ bottom: 16 })
+            }
+          }
+          .width('100%')
+          .height('100%')
         }
 
         if (this.loading && this.errorText.length === 0) {
