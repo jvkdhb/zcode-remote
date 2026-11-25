@@ -19,7 +19,7 @@
 
 ## 下载与安装
 
-1. 从 [Releases](https://github.com/jvkdhb/zcode-remote/releases) 下载最新版 `ZcodeRemote-v18-unsigned.hap`
+1. 从 [Releases](https://github.com/jvkdhb/zcode-remote/releases) 下载最新版 `ZcodeRemote-v30-unsigned.hap`
 2. **未签名包**，需要 **HoKit** 等侧载工具安装（系统设置/应用市场无法安装）
 3. 要求：HarmonyOS NEXT（API 24+，实测 API 26）
 
