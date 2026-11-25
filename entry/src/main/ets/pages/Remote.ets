@@ -29,6 +29,7 @@ struct Remote {
   private lastSnapshot: image.PixelMap | undefined = undefined;
   @State maskVisible: boolean = false;
   @State maskHint: boolean = false;
+  @State maskOpacity: number = 1;
   private webW: number = 0;
   private webH: number = 0;
   private pageLoading: boolean = false;
@@ -39,14 +40,16 @@ struct Remote {
   private capTimer: number = -1;
   private hintTimer: number = -1;
   private hideTimer: number = -1;
+  private fadeTimer: number = -1;
   private settleTimer: number = -1;
-  private snapTimer: number = -1;
   private fgAt: number = 0;
   private lastPersistAt: number = 0;
   private persistBusy: boolean = false;
   private awaitSnapshot: boolean = false;
   private readyAt: number = 0;
   private stableMs: number = 0;
+  // 一次回前台只提示一次「正在恢复会话」，后续重连静默接管
+  private hintShown: boolean = false;
   // 只有「回前台/手动刷新」后的导航才值得用旧画面遮挡；普通站内跳转直接放行
   private maskNavUntil: number = 0;
   // 网页侧连接状态（由注入脚本回报）：socket 未恢复或页面处于连接中时，遮罩不揭开
@@ -114,10 +117,13 @@ struct Remote {
         try {
           var found = !!document.getElementById('zr-hide-topbar');
           var conn = false;
-          try {
-            var bt = document.body ? (document.body.innerText || '') : '';
-            conn = bt.indexOf('正在连接') >= 0 || bt.indexOf('正在加载工作区') >= 0;
-          } catch (e5) {}
+          // 会话页（有输入框/已隐藏顶栏）不扫正文，避免大页面反复算 innerText 造成卡顿
+          if (!found && !document.querySelector('[contenteditable]')) {
+            try {
+              var bt = document.body ? (document.body.textContent || '') : '';
+              conn = bt.indexOf('正在连接') >= 0 || bt.indexOf('正在加载工作区') >= 0;
+            } catch (e5) {}
+          }
           if (conn) {
             try {
               var cnow = Date.now();
@@ -149,31 +155,38 @@ struct Remote {
           }
           var ce = document.querySelector('[contenteditable]');
           if (ce) {
-            var card = ce;
-            for (var i = 0; i < 10 && card; i++) {
-              var cs = getComputedStyle(card);
-              var radius = parseFloat(cs.borderTopLeftRadius) || 0;
-              var bg = cs.backgroundColor;
-              if (radius > 8 && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') { break; }
-              card = card.parentElement;
+            var card = window.__zrCard;
+            if (!card || !card.isConnected) {
+              card = ce;
+              for (var i = 0; i < 10 && card; i++) {
+                var cs = getComputedStyle(card);
+                var radius = parseFloat(cs.borderTopLeftRadius) || 0;
+                var bg = cs.backgroundColor;
+                if (radius > 8 && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') { break; }
+                card = card.parentElement;
+              }
+              window.__zrCard = card;
             }
             if (card && card !== document.body) {
               found = true;
-              // v5：卡片本身保形；把卡片之上的所有祖先（含 body/html）的下内边距/外边距清零
-              var a = card.parentElement;
-              for (var k = 0; k < 12 && a; k++) {
-                if (getComputedStyle(a).paddingBottom !== '0px') { a.style.setProperty('padding-bottom', '0px', 'important'); }
-                if (getComputedStyle(a).marginBottom !== '0px') { a.style.setProperty('margin-bottom', '0px', 'important'); }
-                a = a.parentElement;
-              }
-              if (getComputedStyle(document.body).paddingBottom !== '0px') { document.body.style.setProperty('padding-bottom', '0px', 'important'); }
-              var vp = window.visualViewport;
-              var vh = vp ? Math.round(vp.height + vp.offsetTop) : window.innerHeight;
-              var cr = card.getBoundingClientRect();
-              var gap = vh - cr.bottom;
-              if (gap > 0 && gap < 160) {
-                card.style.transform = 'translateY(' + gap + 'px)';
-                card.dataset.zrShifted = '1';
+              // 已下移过就不再重算（新卡片没有标记，路由切换后仍会自动重跑）
+              if (card.dataset.zrShifted !== '1') {
+                // v5：卡片本身保形；把卡片之上的所有祖先（含 body/html）的下内边距/外边距清零
+                var a = card.parentElement;
+                for (var k = 0; k < 12 && a; k++) {
+                  if (getComputedStyle(a).paddingBottom !== '0px') { a.style.setProperty('padding-bottom', '0px', 'important'); }
+                  if (getComputedStyle(a).marginBottom !== '0px') { a.style.setProperty('margin-bottom', '0px', 'important'); }
+                  a = a.parentElement;
+                }
+                if (getComputedStyle(document.body).paddingBottom !== '0px') { document.body.style.setProperty('padding-bottom', '0px', 'important'); }
+                var vp = window.visualViewport;
+                var vh = vp ? Math.round(vp.height + vp.offsetTop) : window.innerHeight;
+                var cr = card.getBoundingClientRect();
+                var gap = vh - cr.bottom;
+                if (gap > 0 && gap < 160) {
+                  card.style.transform = 'translateY(' + gap + 'px)';
+                  card.dataset.zrShifted = '1';
+                }
               }
             }
           }
@@ -224,26 +237,7 @@ struct Remote {
 
   private handleAppBackground(): void {
     this.clearMask();
-    this.stopSnapTimer();
     this.captureSnapshot(true);
-  }
-
-  private startSnapTimer(): void {
-    if (this.snapTimer >= 0) {
-      return;
-    }
-    this.snapTimer = setInterval(() => {
-      if (!this.maskVisible) {
-        this.captureSnapshot();
-      }
-    }, 15000);
-  }
-
-  private stopSnapTimer(): void {
-    if (this.snapTimer >= 0) {
-      clearInterval(this.snapTimer);
-      this.snapTimer = -1;
-    }
   }
 
   private handleAppForeground(): void {
@@ -264,6 +258,7 @@ struct Remote {
     this.sockClosedAt = 0;
     this.pageConnecting = false;
     this.maskSuppressed = false;
+    this.hintShown = false;
     this.showMask(true);
     this.probeReady(350);
     // 页面若没重载（没有 onPageBegin）且连接正常，3.5s 内揭开
@@ -334,7 +329,7 @@ struct Remote {
 
   private captureSnapshot(force: boolean = false): void {
     // 页面被遮/正在连接时不抓；force 用于退后台前最后一张（哪怕画面是连接页，也是用户最后看到的）
-    if (this.maskVisible || (!force && this.pageConnecting)) {
+    if (!force && (this.maskVisible || this.pageConnecting)) {
       return;
     }
     try {
@@ -439,6 +434,8 @@ struct Remote {
 
   private showMask(holdMin: boolean): void {
     this.clearMaskTimers();
+    if (this.fadeTimer >= 0) { clearTimeout(this.fadeTimer); this.fadeTimer = -1; }
+    this.maskOpacity = 1;
     this.maskVisible = true;
     this.maskHint = false;
     this.readySeen = false;
@@ -453,7 +450,8 @@ struct Remote {
     }, holdMin ? 2500 : 0);
     this.hintTimer = setTimeout(() => {
       this.hintTimer = -1;
-      if (this.maskVisible) {
+      if (this.maskVisible && !this.hintShown) {
+        this.hintShown = true;
         this.maskHint = true;
       }
     }, 2500);
@@ -494,12 +492,24 @@ struct Remote {
 
   private clearMask(): void {
     this.clearMaskTimers();
-    this.maskVisible = false;
-    this.maskHint = false;
-    this.readySeen = false;
-    this.minDone = false;
-    this.readyAt = 0;
-    this.stableMs = 0;
+    if (!this.maskVisible) {
+      this.maskOpacity = 1;
+      return;
+    }
+    // 淡出：用旧画面渐隐盖住揭盖瞬间的重绘空白
+    this.maskOpacity = 0;
+    this.fadeTimer = setTimeout(() => {
+      this.fadeTimer = -1;
+      if (this.maskOpacity === 0) {
+        this.maskVisible = false;
+        this.maskHint = false;
+        this.readySeen = false;
+        this.minDone = false;
+        this.readyAt = 0;
+        this.stableMs = 0;
+        this.maskOpacity = 1;
+      }
+    }, 230);
   }
 
   private clearMaskTimers(): void {
@@ -508,6 +518,7 @@ struct Remote {
     if (this.capTimer >= 0) { clearTimeout(this.capTimer); this.capTimer = -1; }
     if (this.hintTimer >= 0) { clearTimeout(this.hintTimer); this.hintTimer = -1; }
     if (this.hideTimer >= 0) { clearTimeout(this.hideTimer); this.hideTimer = -1; }
+    if (this.fadeTimer >= 0) { clearTimeout(this.fadeTimer); this.fadeTimer = -1; }
     if (this.settleTimer >= 0) { clearTimeout(this.settleTimer); this.settleTimer = -1; }
   }
 
@@ -639,7 +650,6 @@ struct Remote {
       hilog.warn(0x0000, 'ZcodeRemote', 'emitter off failed: %{public}s', JSON.stringify(e));
     }
     this.clearMaskTimers();
-    this.stopSnapTimer();
     if (this.lastSnapshot !== undefined) {
       this.lastSnapshot.release();
       this.lastSnapshot = undefined;
@@ -886,7 +896,6 @@ struct Remote {
               this.loading = false;
               this.pageLoading = false;
               this.applyPageTheme();
-              this.startSnapTimer();
               hilog.info(0x0000, 'ZcodeRemote', 'page end mask=%{public}s', String(this.maskVisible));
               if (this.maskVisible) {
                 this.probeReady(350);
@@ -986,6 +995,8 @@ struct Remote {
           }
           .width('100%')
           .height('100%')
+          .opacity(this.maskOpacity)
+          .animation({ duration: 220, curve: Curve.EaseOut })
         }
 
         if (this.loading && this.errorText.length === 0) {
