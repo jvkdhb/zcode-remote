@@ -690,7 +690,7 @@ struct Remote {
       }
       event.result.handleFileList(out);
       if (this.lastUploadRenamed) {
-        promptAction.showToast({ message: '包已按 .txt 发送，接收后去掉 .txt 即可' });
+        promptAction.showToast({ message: '包已按 .pdf 发送，接收后去掉 .pdf 即可' });
       }
     } catch (e) {
       hilog.warn(0x0000, 'ZcodeRemote', 'fileSelect failed: %{public}s', JSON.stringify(e));
@@ -724,8 +724,9 @@ struct Remote {
       if (name.length === 0) {
         name = 'upload.bin';
       }
-      // .hap/.apk/.zip 等包和压缩包会被远程上传接口拒绝（「附件缺少可读取内容」），
-  // 缓存副本加 .txt 后缀绕过类型白名单；接收后去掉 .txt 即可还原
+      // .hap/.apk/.zip 等包和压缩包会被远程上传接口拒绝（「附件缺少可读取内容」）；
+  // 按 .pdf 发送可保留原始字节（.txt 会被服务端按文本转码，二进制会损坏）。
+  // 接收后去掉 .pdf 即可还原
   let finalName: string = name;
   const blockedExts: string[] = ['.hap', '.hsp', '.app', '.apk', '.aab', '.ipa', '.zip', '.rar',
     '.7z', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.exe', '.msi', '.dmg', '.iso', '.bin',
@@ -733,7 +734,7 @@ struct Remote {
   const lowerName: string = name.toLowerCase();
   for (let i = 0; i < blockedExts.length; i++) {
     if (lowerName.endsWith(blockedExts[i])) {
-      finalName = name + '.txt';
+      finalName = name + '.pdf';
       this.lastUploadRenamed = true;
       break;
     }
